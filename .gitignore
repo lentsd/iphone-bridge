@@ -1,0 +1,37 @@
+# Build products and local development tools
+/.build/
+/.build-device-bridge
+/.test-data/
+/dist/
+/Vendor/ipatool/bin/
+
+# Personal libraries, downloaded apps, logs and credentials
+*.ipa
+*.IPA
+*.ipa.*
+*.log
+library.json
+library-*.json
+*.keychain
+*.keychain-db
+*.pem
+*.p12
+*.p8
+.env
+.env.*
+!.env.example
+auth.json
+cookies.json
+credentials.json
+Архив/
+
+# Machine-specific editor/agent state and macOS metadata
+.DS_Store
+._*
+.idea/
+.vscode/
+.codex/
+.agents/
+AGENTS.md
+*.xcuserstate
+xcuserdata/

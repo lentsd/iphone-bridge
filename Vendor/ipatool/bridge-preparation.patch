@@ -1,0 +1,1097 @@
+--- a/main.go
++++ b/main.go
+@@ -1,11 +1,48 @@
+ package main
+ 
+ import (
++	"context"
++	"fmt"
+ 	"os"
++	"time"
+ 
+ 	"github.com/majd/ipatool/v2/cmd"
++	"github.com/majd/ipatool/v2/internal/sap"
++	"github.com/majd/ipatool/v2/internal/sap/assets"
++	"github.com/majd/ipatool/v2/pkg/appstore"
+ )
+ 
+ func main() {
++	if len(os.Args) == 2 && os.Args[1] == "bridge-prepare" {
++		_ = os.Setenv("IPHONE_BRIDGE_PROGRESS", "1")
++		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
++		defer cancel()
++		if err := appstore.PrepareBridgeBag(ctx); err != nil {
++			fmt.Fprintln(os.Stderr, "Не удалось получить конфигурацию Apple:", err)
++			os.Exit(1)
++		}
++		fmt.Fprintln(os.Stdout, "Конфигурация сервисов Apple получена и проверена.")
++		if _, err := assets.Load(ctx); err != nil {
++			fmt.Fprintln(os.Stderr, "Не удалось подготовить компоненты Apple:", err)
++			os.Exit(1)
++		}
++		if err := sap.PrepareBridgeSAPCertificate(ctx); err != nil {
++			fmt.Fprintln(os.Stderr, "Не удалось получить служебный сертификат Apple:", err)
++			os.Exit(1)
++		}
++		fmt.Fprintln(os.Stdout, "Компоненты готовы. Можно входить в Apple ID.")
++		return
++	}
++	if len(os.Args) == 2 && os.Args[1] == "bridge-check-sap" {
++		_ = os.Setenv("IPHONE_BRIDGE_PROGRESS", "1")
++		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
++		defer cancel()
++		if err := sap.CheckBridgeSAP(ctx); err != nil {
++			fmt.Fprintln(os.Stderr, "Проверка SAP не завершена:", err)
++			os.Exit(1)
++		}
++		fmt.Fprintln(os.Stdout, "SAP-сессия Apple создана. Тестовая подпись получена. Вход в аккаунт не выполнялся.")
++		return
++	}
+ 	os.Exit(cmd.Execute())
+ }
+--- a/internal/sap/assets/assets.go
++++ b/internal/sap/assets/assets.go
+@@ -10,6 +10,7 @@
+ 	"io/fs"
+ 	"os"
+ 	"path/filepath"
++	"time"
+ )
+ 
+ const (
+@@ -83,6 +84,9 @@
+ 	if err := ctx.Err(); err != nil {
+ 		return Bundle{}, fmt.Errorf("load Apple assets: %w", err)
+ 	}
++	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
++	defer cancel()
++	bridgeProgress("Проверяю компоненты Apple…")
+ 
+ 	directory, err := cacheDirectory()
+ 	if err != nil {
+@@ -90,6 +94,7 @@
+ 	}
+ 
+ 	if bundle, err := readCache(directory); err == nil {
++		bridgeProgress("Компоненты Apple готовы.")
+ 		return bundle, nil
+ 	}
+ 
+@@ -101,6 +106,7 @@
+ 	if err := writeCache(directory, bundle); err != nil {
+ 		return Bundle{}, fmt.Errorf("cache Apple SAP assets: %w", err)
+ 	}
++	bridgeProgress("Подготовка компонентов Apple завершена.")
+ 
+ 	return bundle, nil
+ }
+--- a/internal/sap/assets/remote.go
++++ b/internal/sap/assets/remote.go
+@@ -9,6 +9,7 @@
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
++	"time"
+ )
+ 
+ const (
+@@ -31,7 +32,8 @@
+ }
+ 
+ func resolveRemoteImage(ctx context.Context) (Bundle, error) {
+-	client := &http.Client{}
++	client := &http.Client{Timeout: 90 * time.Second}
++	bridgeProgress("Читаю список компонентов Apple…")
+ 	remote, err := openRemoteFile(ctx, client)
+ 	if err != nil {
+ 		return Bundle{}, fmt.Errorf("resolve macOS %s (%s) frameworks: %w", macOSVersion, macOSBuild, err)
+@@ -59,16 +61,50 @@
+ 	defer os.RemoveAll(workspace)
+ 
+ 	frameworkDirectory := filepath.Join(workspace, "frameworks")
+-	if err := extractFrameworkFiles(ctx, client, remote, fileSystemEntry, frameworkDirectory); err != nil {
+-		return Bundle{}, err
++	if err := os.MkdirAll(frameworkDirectory, 0o700); err != nil {
++		return Bundle{}, err
++	}
++	cache, err := cacheDirectory()
++	if err != nil {
++		return Bundle{}, err
++	}
++	frameworkNames := []string{"commerce", "adid", "CoreFP", "CoreFP.icxs", "fairplayd"}
++	allCached := true
++	for _, name := range frameworkNames {
++		if !reuseBridgeCachedFile(cache, frameworkDirectory, name) {
++			allCached = false
++		}
++	}
++	if !allCached {
++		bridgeProgress("Загружаю основные компоненты Apple…")
++		if err := extractFrameworkFiles(ctx, client, remote, fileSystemEntry, frameworkDirectory); err != nil {
++			return Bundle{}, err
++		}
++		if err := saveBridgeCachedFiles(frameworkDirectory, cache, frameworkNames); err != nil {
++			return Bundle{}, err
++		}
++	} else {
++		bridgeProgress("Основные компоненты уже сохранены — повторная загрузка не нужна.")
+ 	}
+ 
+ 	appleMediaServicesPath := filepath.Join(frameworkDirectory, "AppleMediaServices")
+-	if err := extractAppleMediaServices(ctx, client, remote, systemOSEntry, appleMediaServicesPath); err != nil {
+-		return Bundle{}, fmt.Errorf("extract AppleMediaServices from macOS %s (%s): %w", macOSVersion, macOSBuild, err)
+-	}
+-	if err := extractFairPlayKext(archive, filepath.Join(frameworkDirectory, "FairPlayIOKit")); err != nil {
+-		return Bundle{}, err
++	if !reuseBridgeCachedFile(cache, frameworkDirectory, "AppleMediaServices") {
++		bridgeProgress("Подготавливаю службу авторизации Apple…")
++		if err := extractAppleMediaServices(ctx, client, remote, systemOSEntry, appleMediaServicesPath); err != nil {
++			return Bundle{}, fmt.Errorf("extract AppleMediaServices from macOS %s (%s): %w", macOSVersion, macOSBuild, err)
++		}
++		if err := saveBridgeCachedFiles(frameworkDirectory, cache, []string{"AppleMediaServices"}); err != nil {
++			return Bundle{}, err
++		}
++	}
++	if !reuseBridgeCachedFile(cache, frameworkDirectory, "FairPlayIOKit") {
++		bridgeProgress("Загружаю последний компонент Apple (один запрос, около 33 МБ)…")
++		if err := extractFairPlayKext(archive, filepath.Join(frameworkDirectory, "FairPlayIOKit")); err != nil {
++			return Bundle{}, err
++		}
++		if err := saveBridgeCachedFiles(frameworkDirectory, cache, []string{"FairPlayIOKit"}); err != nil {
++			return Bundle{}, err
++		}
+ 	}
+ 
+ 	files := make(map[string][]byte, len(requiredFiles))
+--- a/internal/sap/assets/kernel.go
++++ b/internal/sap/assets/kernel.go
+@@ -6,7 +6,6 @@
+ 	"encoding/asn1"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"os"
+ 
+ 	"github.com/blacktop/go-macho"
+@@ -31,16 +30,9 @@
+ 		return err
+ 	}
+ 
+-	reader, err := entry.Open()
++	data, err := readBridgeZipEntry(entry, kernelCacheArchiveSize)
+ 	if err != nil {
+-		return fmt.Errorf("open pinned kernel collection: %w", err)
+-	}
+-
+-	data, readErr := io.ReadAll(io.LimitReader(reader, kernelCacheArchiveSize+1))
+-	closeErr := reader.Close()
+-
+-	if readErr != nil || closeErr != nil {
+-		return fmt.Errorf("read pinned kernel collection: %w", errors.Join(readErr, closeErr))
++		return fmt.Errorf("read pinned kernel collection: %w", err)
+ 	}
+ 
+ 	if len(data) != kernelCacheArchiveSize {
+--- /dev/null
++++ b/internal/sap/assets/bridge_prepare.go
+@@ -0,0 +1,98 @@
++package assets
++
++import (
++	"archive/zip"
++	"bytes"
++	"compress/flate"
++	"crypto/sha256"
++	"fmt"
++	"hash/crc32"
++	"io"
++	"os"
++	"path/filepath"
++)
++
++func bridgeProgress(message string) {
++	if os.Getenv("IPHONE_BRIDGE_PROGRESS") == "1" {
++		fmt.Fprintln(os.Stderr, "[Подготовка] "+message)
++	}
++}
++
++// Download the compressed ZIP member as a single range before inflating it.
++// Inflating directly from remoteFile causes one HTTP request per small read.
++func readBridgeZipEntry(entry *zip.File, maximum int) ([]byte, error) {
++	if entry.CompressedSize64 > uint64(maximum) || entry.UncompressedSize64 > uint64(maximum) {
++		return nil, fmt.Errorf("ZIP component exceeds size limit")
++	}
++	if entry.Method != zip.Deflate && entry.Method != zip.Store {
++		return nil, fmt.Errorf("unsupported ZIP compression")
++	}
++	raw, err := entry.OpenRaw()
++	if err != nil {
++		return nil, err
++	}
++	compressed := make([]byte, int(entry.CompressedSize64))
++	if _, err = io.ReadFull(raw, compressed); err != nil {
++		return nil, err
++	}
++	var reader io.ReadCloser = io.NopCloser(bytes.NewReader(compressed))
++	if entry.Method == zip.Deflate {
++		reader = flate.NewReader(bytes.NewReader(compressed))
++	}
++	defer reader.Close()
++	data, err := io.ReadAll(io.LimitReader(reader, int64(maximum)+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(data) > maximum || uint64(len(data)) != entry.UncompressedSize64 {
++		return nil, fmt.Errorf("unexpected ZIP component size")
++	}
++	if crc32.ChecksumIEEE(data) != entry.CRC32 {
++		return nil, zip.ErrChecksum
++	}
++	return data, nil
++}
++
++func bridgeFileSpec(name string) (fileSpec, bool) {
++	for _, spec := range requiredFiles {
++		if spec.name == name {
++			return spec, true
++		}
++	}
++	return fileSpec{}, false
++}
++
++func reuseBridgeCachedFile(cache, destination, name string) bool {
++	spec, ok := bridgeFileSpec(name)
++	if !ok {
++		return false
++	}
++	data, err := readCacheFile(filepath.Join(cache, name), spec.size)
++	if err != nil || sha256.Sum256(data) != spec.digest {
++		return false
++	}
++	return os.WriteFile(filepath.Join(destination, name), data, 0o600) == nil
++}
++
++func saveBridgeCachedFiles(source, destination string, names []string) error {
++	if err := os.MkdirAll(destination, 0o700); err != nil {
++		return err
++	}
++	for _, name := range names {
++		spec, ok := bridgeFileSpec(name)
++		if !ok {
++			return fmt.Errorf("unknown Apple component")
++		}
++		data, err := readCacheFile(filepath.Join(source, name), spec.size)
++		if err != nil {
++			return err
++		}
++		if sha256.Sum256(data) != spec.digest {
++			return fmt.Errorf("Apple component %s failed SHA-256 verification", name)
++		}
++		if err = replaceFile(filepath.Join(destination, name), data); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+--- /dev/null
++++ b/internal/sap/assets/bridge_prepare_test.go
+@@ -0,0 +1,81 @@
++package assets
++
++import (
++	"archive/zip"
++	"bytes"
++	"errors"
++	"io"
++	"math/rand"
++	"testing"
++)
++
++type bridgeCountingReader struct {
++	*bytes.Reader
++	largeReads int
++}
++
++func (r *bridgeCountingReader) ReadAt(data []byte, offset int64) (int, error) {
++	if len(data) > 32*1024 {
++		r.largeReads++
++	}
++	return r.Reader.ReadAt(data, offset)
++}
++
++func bridgeTestEntry(t *testing.T) (*zip.File, *bridgeCountingReader, []byte) {
++	t.Helper()
++	data := make([]byte, 256*1024)
++	_, _ = rand.New(rand.NewSource(17)).Read(data)
++	var buffer bytes.Buffer
++	w := zip.NewWriter(&buffer)
++	entry, err := w.Create("component")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = entry.Write(data); err != nil {
++		t.Fatal(err)
++	}
++	if err = w.Close(); err != nil {
++		t.Fatal(err)
++	}
++	r := &bridgeCountingReader{Reader: bytes.NewReader(buffer.Bytes())}
++	z, err := zip.NewReader(r, int64(buffer.Len()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	r.largeReads = 0
++	return z.File[0], r, data
++}
++
++func TestBridgeReadsCompressedComponentInOneLargeRange(t *testing.T) {
++	entry, reader, expected := bridgeTestEntry(t)
++	data, err := readBridgeZipEntry(entry, 512*1024)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(data, expected) {
++		t.Fatal("component bytes changed")
++	}
++	if reader.largeReads != 1 {
++		t.Fatalf("large remote reads = %d, want 1", reader.largeReads)
++	}
++}
++
++func TestBridgeBulkReadPreservesChecksumValidation(t *testing.T) {
++	entry, _, _ := bridgeTestEntry(t)
++	entry.CRC32 ^= 1
++	_, err := readBridgeZipEntry(entry, 512*1024)
++	if !errors.Is(err, zip.ErrChecksum) {
++		t.Fatalf("got %v, want checksum rejection", err)
++	}
++}
++
++func TestBridgeBulkReadRejectsOversizedAndTruncatedComponents(t *testing.T) {
++	entry, _, _ := bridgeTestEntry(t)
++	if _, err := readBridgeZipEntry(entry, 1024); err == nil {
++		t.Fatal("accepted oversized component")
++	}
++	entry.CompressedSize64 += 1024
++	if _, err := readBridgeZipEntry(entry, 512*1024); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
++		t.Fatalf("got %v, want truncated archive failure", err)
++	}
++}
+--- a/cmd/auth.go
++++ b/cmd/auth.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"time"
+ 
+ 	"github.com/avast/retry-go"
+@@ -64,7 +65,7 @@
+ 			return retry.Do(func() error {
+ 				if errors.Is(lastErr, appstore.ErrAuthCodeRequired) && interactive {
+ 					var err error
+-					authCode, err = readPrompt("enter 2FA code: ", false)
++					authCode, err = readBridgeAuthCode(os.Stdin, os.Stderr)
+ 					if err != nil {
+ 						return fmt.Errorf("failed to read auth code: %w", err)
+ 					}
+--- a/cmd/prompt.go
++++ b/cmd/prompt.go
+@@ -32,12 +32,12 @@
+ 		return readMaskedInput(os.Stdin, os.Stderr)
+ 	}
+ 
+-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
++	line, err := readBridgeTerminalLine(os.Stdin)
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to read input: %w", err)
+ 	}
+ 
+-	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), nil
++	return line, nil
+ }
+ 
+ func readMaskedInput(input io.Reader, output io.Writer) (string, error) {
+--- /dev/null
++++ b/cmd/bridge_auth_input.go
+@@ -0,0 +1,74 @@
++package cmd
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++
++	"github.com/majd/ipatool/v2/pkg/appstore"
++)
++
++// Read exactly one terminal line without buffering characters for the next
++// prompt. A pasted newline inside bracketed-paste markers belongs to the paste.
++func readBridgeTerminalLine(input io.Reader) (string, error) {
++	const start = "\x1b[200~"
++	const end = "\x1b[201~"
++	var buffer []byte
++	var one [1]byte
++	pasteDepth := 0
++	pasteNewline := false
++	for count := 0; count < 8192; count++ {
++		if _, err := io.ReadFull(input, one[:]); err != nil {
++			return "", err
++		}
++		buffer = append(buffer, one[0])
++		if bytes.HasSuffix(buffer, []byte(start)) {
++			buffer = buffer[:len(buffer)-len(start)]
++			pasteDepth++
++			continue
++		}
++		if bytes.HasSuffix(buffer, []byte(end)) {
++			buffer = buffer[:len(buffer)-len(end)]
++			if pasteDepth > 0 {
++				pasteDepth--
++			}
++			if pasteDepth == 0 && pasteNewline {
++				return strings.TrimRight(string(buffer), "\r\n"), nil
++			}
++			continue
++		}
++		if one[0] == '\n' {
++			if pasteDepth > 0 {
++				pasteNewline = true
++				continue
++			}
++			return strings.TrimSuffix(string(buffer[:len(buffer)-1]), "\r"), nil
++		}
++		if one[0] == '\r' && pasteDepth > 0 {
++			pasteNewline = true
++		}
++	}
++	return "", errors.New("input line is too long")
++}
++
++func readBridgeAuthCode(input io.Reader, output io.Writer) (string, error) {
++	for {
++		if _, err := io.WriteString(output, "enter 2FA code: "); err != nil {
++			return "", err
++		}
++		line, err := readBridgeTerminalLine(input)
++		if err != nil {
++			return "", fmt.Errorf("failed to read auth code: %w", err)
++		}
++		code, err := appstore.NormalizeAuthCode(line)
++		if err == nil && code != "" {
++			return code, nil
++		}
++		// Never echo the code or initiate another Apple request for malformed input.
++		if _, err = io.WriteString(output, "Код не распознан. Введи шесть цифр 0–9 ещё раз; пароль сохранён только в этой попытке.\n"); err != nil {
++			return "", err
++		}
++	}
++}
+--- /dev/null
++++ b/cmd/bridge_auth_input_test.go
+@@ -0,0 +1,62 @@
++package cmd
++
++import (
++	"bytes"
++	"strings"
++	"testing"
++)
++
++func TestBridgeAuthCodeHandlesTerminalPasteAndInvisibleFormatting(t *testing.T) {
++	for name, input := range map[string]string{
++		"typed":                    "012345\n",
++		"bracketed paste":          "\x1b[200~012345\x1b[201~\n",
++		"newline inside paste":     "\x1b[200~012345\n\x1b[201~",
++		"CRLF inside paste":        "\x1b[200~012345\r\n\x1b[201~",
++		"invisible SMS formatting": "\u2066012\u200b345\u2069\n",
++		"spaces and newline":       " 012\u00a0345 \r\n",
++		"stray terminal paste end": "012345\x1b[201~\n",
++	} {
++		t.Run(name, func(t *testing.T) {
++			var output bytes.Buffer
++			code, err := readBridgeAuthCode(strings.NewReader(input), &output)
++			if err != nil || code != "012345" {
++				t.Fatalf("valid formatted test code was rejected: %v", err)
++			}
++			if strings.Contains(output.String(), "012345") {
++				t.Fatal("prompt logged the code")
++			}
++		})
++	}
++}
++
++func TestBridgeAuthCodeRepromptsLocallyWithoutLoggingRejectedInput(t *testing.T) {
++	var output bytes.Buffer
++	code, err := readBridgeAuthCode(strings.NewReader("bad-input\n12345\n\n012345\n"), &output)
++	if err != nil || code != "012345" {
++		t.Fatalf("retry failed: %v", err)
++	}
++	if strings.Count(output.String(), "enter 2FA code:") != 4 {
++		t.Fatal("malformed input did not reprompt locally")
++	}
++	if strings.Contains(output.String(), "bad-input") || strings.Contains(output.String(), "012345") {
++		t.Fatal("code appeared in output")
++	}
++}
++
++func TestBridgeTerminalLinePreservesFollowingPromptInput(t *testing.T) {
++	input := strings.NewReader("first\r\nsecond\n")
++	first, err1 := readBridgeTerminalLine(input)
++	second, err2 := readBridgeTerminalLine(input)
++	if err1 != nil || err2 != nil || first != "first" || second != "second" {
++		t.Fatal("reading a prompt consumed the next prompt's input")
++	}
++}
++
++func TestBridgeAuthCodeRejectsTruncatedPasteAndUnknownEscape(t *testing.T) {
++	for _, input := range []string{"\x1b[200~012345\n", "012345\x1b[A\n"} {
++		var output bytes.Buffer
++		if _, err := readBridgeAuthCode(strings.NewReader(input), &output); err == nil {
++			t.Fatal("accepted malformed terminal input")
++		}
++	}
++}
+--- a/pkg/appstore/appstore_login.go
++++ b/pkg/appstore/appstore_login.go
+@@ -53,6 +53,11 @@
+ }
+ 
+ func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
++	code, err := normalizeAuthCode(input.AuthCode)
++	if err != nil {
++		return LoginOutput{}, err
++	}
++	input.AuthCode = code
+ 	if t.authBackend != nil {
+ 		return t.nativeLogin(input)
+ 	}
+@@ -121,6 +126,14 @@
+ 	if code == "" {
+ 		return "", nil
+ 	}
++	// Copying a code from a message can include invisible direction and
++	// zero-width formatting marks. They do not change the six visible digits.
++	code = strings.Map(func(r rune) rune {
++		if unicode.Is(unicode.Cf, r) {
++			return -1
++		}
++		return r
++	}, code)
+ 
+ 	// Terminals may wrap pasted input in bracketed-paste markers. Strip only
+ 	// a matched outer pair; other escape sequences are invalid input.
+@@ -142,6 +155,10 @@
+ 
+ 	return code, nil
+ }
++
++// NormalizeAuthCode validates a code before interactive callers start a network
++// request. Empty input is allowed only for the initial, code-free login attempt.
++func NormalizeAuthCode(code string) (string, error) { return normalizeAuthCode(code) }
+ 
+ type loginAddressResult struct {
+ 	FirstName string `plist:"firstName,omitempty"`
+--- /dev/null
++++ b/pkg/appstore/bridge_auth_code_test.go
+@@ -0,0 +1,21 @@
++package appstore
++
++import "testing"
++
++func TestBridgeNormalizesVisibleCodeWithoutChangingItsDigits(t *testing.T) {
++	for _, input := range []string{"012345", "\u2066012345\u2069", "0\u200b12\ufeff345", "\u200e\x1b[200~012 345\x1b[201~\u200f"} {
++		code, err := NormalizeAuthCode(input)
++		if err != nil || code != "012345" {
++			t.Fatalf("formatted six-digit code rejected: %v", err)
++		}
++	}
++}
++
++func TestBridgeRejectsInvalidCodesBeforeNativeAuthentication(t *testing.T) {
++	store := &appstore{}
++	for _, input := range []string{"12345", "1234567", "abc012345", "012345\x1b[A", "\u2066\u2069", "１２３４５６"} {
++		if _, err := store.Login(LoginInput{AuthCode: input}); err == nil || err.Error() != "2FA code must contain exactly six digits" {
++			t.Fatal("invalid code reached account authentication")
++		}
++	}
++}
+--- a/pkg/appstore/appstore_bag.go
++++ b/pkg/appstore/appstore_bag.go
+@@ -1,17 +1,20 @@
+ package appstore
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	gohttp "net/http"
+ 	"net/url"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 
++	"github.com/majd/ipatool/v2/internal/sap"
+ 	"github.com/majd/ipatool/v2/pkg/http"
+ )
+ 
+-type BagInput struct{}
++type BagInput struct{ Context context.Context }
+ 
+ type BagOutput struct {
+ 	// AuthEndpoint is retained for callers that inspect the bag directly.
+@@ -30,11 +33,19 @@
+ 		return BagOutput{}, err
+ 	}
+ 
+-	return t.bag(guid)
++	ctx := input.Context
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	return t.bagWithContext(ctx, guid)
+ }
+ 
+ func (t *appstore) bag(guid string) (BagOutput, error) {
+-	bag, err := t.fetchURLBag(guid)
++	return t.bagWithContext(context.Background(), guid)
++}
++
++func (t *appstore) bagWithContext(ctx context.Context, guid string) (BagOutput, error) {
++	bag, err := t.fetchURLBagWithContext(ctx, guid)
+ 	if err != nil {
+ 		return BagOutput{}, err
+ 	}
+@@ -72,7 +83,25 @@
+ 
+ // Download endpoints do not require the authentication-specific SAP configuration.
+ func (t *appstore) fetchURLBag(guid string) (urlBag, error) {
+-	res, err := t.bagClient.Send(t.bagRequest(guid))
++	return t.fetchURLBagWithContext(context.Background(), guid)
++}
++
++func (t *appstore) fetchURLBagWithContext(ctx context.Context, guid string) (urlBag, error) {
++	var res http.Result[bagResult]
++	var err error
++	if runtime.GOOS == "darwin" && t.authBackend != nil {
++		request := t.bagRequest(guid)
++		var document []byte
++		document, err = sap.FetchBridgeURLBag(ctx, request.URL, request.Headers)
++		if err == nil {
++			err = http.DecodePropertyList(document, &res.Data)
++			res.StatusCode = gohttp.StatusOK
++		}
++	} else {
++		request := t.bagRequest(guid)
++		request.Context = ctx
++		res, err = t.bagClient.Send(request)
++	}
+ 	if err != nil {
+ 		return urlBag{}, fmt.Errorf("failed to send http request: %w", err)
+ 	}
+--- /dev/null
++++ b/pkg/appstore/bridge_prepare_bag.go
+@@ -0,0 +1,16 @@
++package appstore
++
++import (
++	"context"
++	"github.com/majd/ipatool/v2/pkg/util/machine"
++	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
++)
++
++// PrepareBridgeBag exercises the same production bag path used by Login,
++// including the actual machine identity, without opening an account/keychain.
++func PrepareBridgeBag(ctx context.Context) error {
++	platform := operatingsystem.New()
++	client := NewAppStore(Args{Machine: machine.New(machine.Args{OS: platform}), OperatingSystem: platform})
++	_, err := client.Bag(BagInput{Context: ctx})
++	return err
++}
+--- a/internal/sap/protocol.go
++++ b/internal/sap/protocol.go
+@@ -7,6 +7,7 @@
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"runtime"
+ 
+ 	"howett.net/plist"
+ 
+@@ -64,6 +65,9 @@
+ }
+ 
+ func (p setupProtocol) send(request *http.Request) ([]byte, error) {
++	if runtime.GOOS == "darwin" && bridgeSAPEligible(request) {
++		return bridgeSAPSend(request)
++	}
+ 	response, err := p.client.Do(request)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("send SAP request: %w", err)
+--- a/internal/sap/signer_local.go
++++ b/internal/sap/signer_local.go
+@@ -21,6 +21,26 @@
+ }
+ 
+ func NewSigner(ctx context.Context, config Config) (ActionSigner, error) {
++	for attempt := 0; attempt < 2; attempt++ {
++		signer, err := newBridgeSignerAttempt(ctx, config)
++		if err == nil {
++			return signer, nil
++		}
++		var network *bridgeSAPNetworkError
++		if attempt == 1 || !errors.As(err, &network) {
++			return nil, err
++		}
++		bridgeSAPProgress("Соединение с Apple оборвалось. Повторяю подготовку защищённого соединения…")
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(time.Second):
++		}
++	}
++	return nil, errors.New("SAP setup did not complete")
++}
++
++func newBridgeSignerAttempt(ctx context.Context, config Config) (ActionSigner, error) {
+ 	if ctx == nil {
+ 		return nil, errors.New("SAP signer context is nil")
+ 	}
+--- /dev/null
++++ b/internal/sap/bridge_transport.go
+@@ -0,0 +1,220 @@
++package sap
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"strconv"
++	"strings"
++)
++
++const bridgeCertificateURL = "https://s.mzstatic.com/sap/setupCert.plist"
++const bridgeSetupURL = "https://fpinit.itunes.apple.com/v1/signSapSetup/legacy"
++
++type bridgeSAPNetworkError struct{ cause error }
++
++func (e *bridgeSAPNetworkError) Error() string {
++	return "Apple service connection interrupted: " + e.cause.Error()
++}
++func (e *bridgeSAPNetworkError) Unwrap() error { return e.cause }
++
++func bridgeSAPProgress(message string) {
++	if os.Getenv("IPHONE_BRIDGE_PROGRESS") == "1" {
++		fmt.Fprintln(os.Stderr, "[Соединение] "+message)
++	}
++}
++
++// These requests contain only public bootstrap data and the SAP handshake.
++// Account credentials, cookies and authentication requests never use this path.
++func bridgeSAPEligible(request *http.Request) bool {
++	if request == nil || request.URL == nil {
++		return false
++	}
++	u := request.URL
++	if u.Scheme != "https" || u.User != nil || u.Fragment != "" || u.RawPath != "" || (u.Port() != "" && u.Port() != "443") {
++		return false
++	}
++	if bridgeBagEligible(request) {
++		return true
++	}
++	if u.RawQuery != "" {
++		return false
++	}
++	return request.Method == http.MethodGet && u.Hostname() == "s.mzstatic.com" && u.Path == "/sap/setupCert.plist" || request.Method == http.MethodPost && u.Hostname() == "fpinit.itunes.apple.com" && u.Path == "/v1/signSapSetup/legacy"
++}
++
++func bridgeBagEligible(request *http.Request) bool {
++	if request == nil || request.URL == nil || request.Method != http.MethodGet {
++		return false
++	}
++	u := request.URL
++	if u.Scheme != "https" || u.Hostname() != "init.itunes.apple.com" || u.Path != "/bag.xml" || u.User != nil || u.Fragment != "" || u.RawPath != "" || (u.Port() != "" && u.Port() != "443") {
++		return false
++	}
++	query, err := url.ParseQuery(u.RawQuery)
++	if err != nil {
++		return false
++	}
++	for name, values := range query {
++		if len(values) != 1 || name != "guid" && name != "ix" {
++			return false
++		}
++	}
++	guid := query.Get("guid")
++	if len(guid) != 12 || strings.IndexFunc(guid, func(r rune) bool { return !strings.ContainsRune("0123456789abcdefABCDEF", r) }) != -1 {
++		return false
++	}
++	return len(query["ix"]) == 0 || query.Get("ix") == "6"
++}
++
++type bridgeBoundedOutput struct {
++	bytes.Buffer
++	maximum  int
++	overflow bool
++}
++
++func (b *bridgeBoundedOutput) Write(data []byte) (int, error) {
++	length := len(data)
++	remaining := b.maximum - b.Len()
++	if len(data) > remaining {
++		b.overflow = true
++		data = data[:remaining]
++	}
++	_, _ = b.Buffer.Write(data)
++	return length, nil
++}
++
++func bridgeSAPCommand(request *http.Request) ([]string, []byte, error) {
++	if !bridgeSAPEligible(request) {
++		return nil, nil, errors.New("unsupported public SAP endpoint")
++	}
++	args := []string{"--http1.1", "--silent", "--show-error", "--fail", "--proto", "=https", "--connect-timeout", "8", "--max-time", "20", "--max-filesize", strconv.FormatInt(maxSetupBody, 10), "--write-out", "\n%{http_code}", "--request", request.Method, "--url", request.URL.String()}
++	for _, name := range []string{"User-Agent", "Content-Type", "Accept"} {
++		value := request.Header.Get(name)
++		if strings.ContainsAny(value, "\r\n\x00") {
++			return nil, nil, errors.New("invalid SAP header")
++		}
++		if value != "" {
++			args = append(args, "--header", name+": "+value)
++		}
++	}
++	var body []byte
++	if request.Method == http.MethodGet {
++		args = append(args, "--retry", "2", "--retry-all-errors", "--retry-max-time", "45")
++	} else {
++		if request.Body != nil {
++			var err error
++			body, err = io.ReadAll(io.LimitReader(request.Body, maxSetupBody+1))
++			_ = request.Body.Close()
++			if err != nil {
++				return nil, nil, err
++			}
++			if int64(len(body)) > maxSetupBody {
++				return nil, nil, errors.New("SAP request exceeds size limit")
++			}
++		}
++		// The encrypted handshake travels through stdin, never argv or a file.
++		args = append(args, "--data-binary", "@-")
++	}
++	return args, body, nil
++}
++
++func bridgeSAPSend(request *http.Request) ([]byte, error) {
++	args, body, err := bridgeSAPCommand(request)
++	if err != nil {
++		return nil, err
++	}
++	if bridgeBagEligible(request) {
++		bridgeSAPProgress("Загружаю конфигурацию сервисов Apple…")
++	} else if request.Method == http.MethodGet {
++		bridgeSAPProgress("Загружаю служебный сертификат Apple…")
++	} else {
++		bridgeSAPProgress("Устанавливаю защищённое соединение с Apple…")
++	}
++	command := exec.CommandContext(request.Context(), "/usr/bin/curl", args...)
++	command.Stdin = bytes.NewReader(body)
++	output := &bridgeBoundedOutput{maximum: int(maxSetupBody) + 8}
++	diagnostic := &bridgeBoundedOutput{maximum: 512}
++	command.Stdout = output
++	command.Stderr = diagnostic
++	if err = command.Run(); err != nil {
++		var exit *exec.ExitError
++		if errors.As(err, &exit) {
++			switch exit.ExitCode() {
++			case 5, 6, 7, 18, 28, 35, 52, 56:
++				return nil, &bridgeSAPNetworkError{cause: fmt.Errorf("HTTPS request failed (curl %d)", exit.ExitCode())}
++			}
++		}
++		return nil, fmt.Errorf("SAP HTTPS request failed: %w", err)
++	}
++	if output.overflow {
++		return nil, errors.New("SAP response exceeds size limit")
++	}
++	data := output.Bytes()
++	end := bytes.LastIndexByte(data, '\n')
++	if end < 0 {
++		return nil, errors.New("SAP response has no HTTP status")
++	}
++	status, err := strconv.Atoi(string(data[end+1:]))
++	if err != nil || status != http.StatusOK {
++		return nil, fmt.Errorf("Apple SAP returned HTTP %d", status)
++	}
++	if int64(end) > maxSetupBody {
++		return nil, errors.New("SAP response exceeds size limit")
++	}
++	return data[:end], nil
++}
++
++// FetchBridgeURLBag fetches only the public machine configuration. It never
++// forwards account headers, cookies or credentials to a subprocess.
++func FetchBridgeURLBag(ctx context.Context, endpoint string, headers map[string]string) ([]byte, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return nil, err
++	}
++	if !bridgeBagEligible(request) {
++		return nil, errors.New("unsupported public Apple configuration URL")
++	}
++	for name, value := range headers {
++		request.Header.Set(name, value)
++	}
++	return bridgeSAPSend(request)
++}
++
++// PrepareBridgeSAPCertificate checks this public dependency before any password
++// is requested. It does not read an account or create an authentication session.
++func PrepareBridgeSAPCertificate(ctx context.Context) error {
++	u, _ := url.Parse(bridgeCertificateURL)
++	body, err := bridgeSAPSend((&http.Request{Method: http.MethodGet, URL: u, Header: make(http.Header)}).WithContext(ctx))
++	if err != nil {
++		return err
++	}
++	if _, err = plistBytes(body, setupCertificateKey); err != nil {
++		return err
++	}
++	bridgeSAPProgress("Служебный сертификат Apple доступен.")
++	return nil
++}
++
++// CheckBridgeSAP exercises the whole bootstrap and signer without an Apple ID.
++func CheckBridgeSAP(ctx context.Context) error {
++	signer, err := NewSigner(ctx, Config{SetupURL: bridgeSetupURL, CertificateURL: bridgeCertificateURL, Version: 200, HardwareID: []byte{2, 0, 0, 0, 0, 1}})
++	if err != nil {
++		return err
++	}
++	defer signer.Close()
++	result, err := signer.Sign([]byte("iPhone Bridge public SAP connectivity check"))
++	if err != nil {
++		return err
++	}
++	if len(result) == 0 {
++		return errors.New("SAP signer returned empty result")
++	}
++	return nil
++}
+--- /dev/null
++++ b/internal/sap/bridge_transport_test.go
+@@ -0,0 +1,109 @@
++package sap
++
++import (
++	"bytes"
++	"net/http"
++	"strings"
++	"testing"
++)
++
++func TestBridgeSAPRestrictsTheSystemTransportToPublicBootstrapEndpoints(t *testing.T) {
++	for _, raw := range []string{"http://s.mzstatic.com/sap/setupCert.plist", "https://s.mzstatic.com.attacker.test/sap/setupCert.plist", "https://user@s.mzstatic.com/sap/setupCert.plist", "https://s.mzstatic.com:8443/sap/setupCert.plist", "https://s.mzstatic.com/sap/setupCert.plist?token=private", "https://s.mzstatic.com/sap/setupCert.plist#fragment", "https://auth.itunes.apple.com/auth/v1/native"} {
++		req, err := http.NewRequest(http.MethodGet, raw, nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if bridgeSAPEligible(req) {
++			t.Fatal("accepted a non-public or modified endpoint")
++		}
++	}
++	get, _ := http.NewRequest(http.MethodGet, bridgeCertificateURL, nil)
++	post, _ := http.NewRequest(http.MethodPost, bridgeSetupURL, nil)
++	if !bridgeSAPEligible(get) || !bridgeSAPEligible(post) {
++		t.Fatal("rejected expected Apple endpoints")
++	}
++}
++
++func TestBridgeSAPKeepsHeadersAndHandshakeOutOfCommandArguments(t *testing.T) {
++	payload := []byte("private encrypted handshake\x00binary-data")
++	req, _ := http.NewRequest(http.MethodPost, bridgeSetupURL, bytes.NewReader(payload))
++	req.Header.Set("Cookie", "do-not-forward")
++	req.Header.Set("Authorization", "do-not-forward")
++	req.Header.Set("Content-Type", "application/x-plist")
++	args, body, err := bridgeSAPCommand(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	joined := strings.Join(args, " ")
++	if !bytes.Equal(body, payload) {
++		t.Fatal("handshake bytes changed")
++	}
++	if strings.Contains(joined, "private encrypted") || strings.Contains(joined, "do-not-forward") || strings.Contains(joined, "--insecure") || strings.Contains(joined, "--retry") {
++		t.Fatal("request exposed private data, disabled HTTPS validation, or replayed a stateful POST")
++	}
++	if !strings.Contains(joined, "--data-binary @-") {
++		t.Fatal("handshake is not sent through stdin")
++	}
++}
++
++func TestBridgeSAPLimitsResponseMemoryAndRequestSize(t *testing.T) {
++	buffer := &bridgeBoundedOutput{maximum: 4}
++	n, err := buffer.Write([]byte("12345678"))
++	if err != nil || n != 8 || buffer.Len() != 4 || !buffer.overflow {
++		t.Fatal("unbounded response memory")
++	}
++	req, _ := http.NewRequest(http.MethodPost, bridgeSetupURL, strings.NewReader(strings.Repeat("x", int(maxSetupBody)+1)))
++	if _, _, err := bridgeSAPCommand(req); err == nil {
++		t.Fatal("accepted an oversized handshake")
++	}
++}
++
++func TestBridgeSAPRetriesOnlyThePublicCertificateDownload(t *testing.T) {
++	req, _ := http.NewRequest(http.MethodGet, bridgeCertificateURL, nil)
++	args, body, err := bridgeSAPCommand(req)
++	if err != nil || len(body) != 0 || !strings.Contains(strings.Join(args, " "), "--retry 2") {
++		t.Fatal("public certificate download has no bounded retry")
++	}
++}
++
++func TestBridgeBagAllowsOnlyMachineConfigurationParameters(t *testing.T) {
++	for _, raw := range []string{
++		"https://init.itunes.apple.com/bag.xml?ix=6&guid=001122AABBCC",
++		"https://init.itunes.apple.com/bag.xml?guid=001122aabbcc",
++	} {
++		req, _ := http.NewRequest(http.MethodGet, raw, nil)
++		if !bridgeBagEligible(req) || !bridgeSAPEligible(req) {
++			t.Fatal("rejected public machine configuration")
++		}
++	}
++	for _, raw := range []string{
++		"http://init.itunes.apple.com/bag.xml?guid=001122AABBCC",
++		"https://init.itunes.apple.com.attacker.test/bag.xml?guid=001122AABBCC",
++		"https://init.itunes.apple.com/bag.xml?guid=short",
++		"https://init.itunes.apple.com/bag.xml?guid=001122AABBCC&appleId=private",
++		"https://init.itunes.apple.com/bag.xml?guid=001122AABBCC&guid=001122AABBCC",
++		"https://init.itunes.apple.com/bag.xml?guid=001122AABBCC&ix=other",
++		"https://init.itunes.apple.com/bag.xml?guid=001122AABBCC#fragment",
++	} {
++		req, _ := http.NewRequest(http.MethodGet, raw, nil)
++		if bridgeBagEligible(req) || bridgeSAPEligible(req) {
++			t.Fatal("accepted unrelated parameters or endpoint")
++		}
++	}
++}
++
++func TestBridgeBagPreservesPublicHeadersAndDropsAccountData(t *testing.T) {
++	req, _ := http.NewRequest(http.MethodGet, "https://init.itunes.apple.com/bag.xml?ix=6&guid=001122AABBCC", nil)
++	req.Header.Set("User-Agent", "Configurator-test")
++	req.Header.Set("Accept", "application/xml")
++	req.Header.Set("Cookie", "do-not-forward")
++	req.Header.Set("Authorization", "do-not-forward")
++	args, body, err := bridgeSAPCommand(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	text := strings.Join(args, " ")
++	if len(body) != 0 || strings.Contains(text, "do-not-forward") || !strings.Contains(text, "Accept: application/xml") || !strings.Contains(text, "User-Agent: Configurator-test") || !strings.Contains(text, "--retry 2") {
++		t.Fatal("public bag transport did not preserve its privacy and retry contract")
++	}
++}

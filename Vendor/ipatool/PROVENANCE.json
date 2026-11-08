@@ -1,0 +1,12 @@
+{
+  "tool": "ipatool",
+  "version": "2.7.0+001d889.bridge6",
+  "source_commit": "001d889896fcb118546443c5dfe0997d11b74f56",
+  "source_url": "https://github.com/majd/ipatool/commit/001d889896fcb118546443c5dfe0997d11b74f56",
+  "source_archive_sha256": "8b61a6925409a2fb669be92d83df6bfae7a8ccfbb03f567fe7ec80240934dd11",
+  "local_patch": "bridge-preparation.patch",
+  "local_patch_sha256": "9259968e2a89f445b1c28ac6c2551e5413e424c49f5a204528a58a181955d468",
+  "local_source_modifications": true,
+  "binary_sha256_before_app_signing": "6288e72071575b1e77a929cb9cc99879a7596a91484e81c869d5bf652df73151",
+  "compiler": "go version go1.27.1 darwin/arm64"
+}
